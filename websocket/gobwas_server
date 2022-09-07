@@ -1,0 +1,192 @@
+package websocket
+
+import (
+	"bytes"
+	"encoding/binary"
+	"github.com/gobwas/ws"
+	_ "github.com/gobwas/ws"
+	"github.com/gobwas/ws/wsutil"
+	_ "github.com/gobwas/ws/wsutil"
+	"github.com/google/uuid"
+	"log"
+	"net"
+	"net/http"
+	"strconv"
+	"strings"
+)
+
+var maxPacketsPerClient int = 100000
+
+type subsPayload struct {
+	symbols  []string
+	client   *client
+	subsCode int8 //0 for unsubscribe and 1 for subscribe
+}
+
+type MDSServer struct {
+	subsConnMap     map[string]map[string]*client
+	subsPayloadChan chan subsPayload //for updating subs connection map
+	tokenChan       chan string
+	quote1Map       map[string][]byte
+}
+
+type client struct {
+	ID       string
+	dataChan chan string
+	conn     net.Conn
+	subsMap  map[string]bool
+}
+
+type Quote1packet struct {
+	Symbol          string
+	ExchangeSegment int32
+	LastTradedPrice int32
+	LChange         int32
+	OI              int32
+	OIChange        int32
+}
+
+func New() (*MDSServer, error) {
+	mdsServer := MDSServer{}
+	mdsServer.tokenChan = make(chan string, 1000000)
+	mdsServer.subsConnMap = make(map[string]map[string]*client)
+	mdsServer.quote1Map = make(map[string][]byte)
+	mdsServer.subsPayloadChan = make(chan subsPayload, 10000)
+	return &mdsServer, nil
+}
+
+func (mdsServer *MDSServer) Init() {
+	go mdsServer.updateSubsMap()
+	go mdsServer.communicateTick()
+	http.ListenAndServe(":8080", http.HandlerFunc(mdsServer.connect))
+
+}
+
+func (mdsServer *MDSServer) connect(w http.ResponseWriter, r *http.Request) {
+	conn, _, _, err := ws.UpgradeHTTP(r, w)
+	if err != nil {
+		w.WriteHeader(500)
+		return
+	}
+
+	uid, _ := uuid.NewUUID()
+	client := client{
+		ID:       uid.String(),
+		dataChan: make(chan string, maxPacketsPerClient),
+		conn:     conn,
+		subsMap:  make(map[string]bool),
+	}
+
+	go mdsServer.readData(&client)
+}
+
+func (mdsServer *MDSServer) readData(client *client) {
+	defer client.conn.Close()
+	go mdsServer.writeTickToClient(client)
+	for {
+		msg, op, err := wsutil.ReadClientData(client.conn)
+		if op == ws.OpClose {
+			log.Printf("received connection close ")
+			return
+		}
+		if err != nil {
+			log.Printf("Error while reading message for connection %v", err)
+			return
+		}
+		if len(msg) > 0 {
+			if _, exist := client.subsMap["test"]; !exist {
+				client.subsMap["test"] = true
+				mdsServer.subsPayloadChan <- subsPayload{[]string{"test"}, client, 1}
+			}
+		}
+	}
+}
+
+func (mdsServer *MDSServer) updateSubsMap() {
+	for val := range mdsServer.subsPayloadChan {
+		if val.subsCode == 0 {
+			mdsServer.unsubscribe(val.symbols, val.client)
+		} else {
+			mdsServer.subscribe(val.symbols, val.client)
+		}
+	}
+}
+
+func (mdsServer *MDSServer) subscribe(symbols []string, ws *client) {
+	for _, token := range symbols {
+		if _, exist := mdsServer.subsConnMap[token]; !exist {
+			mdsServer.subsConnMap[token] = make(map[string]*client)
+		}
+		mdsServer.subsConnMap[token][ws.ID] = ws
+	}
+}
+
+func (mdsServer *MDSServer) unsubscribe(symbols []string, ws *client) {
+	for _, token := range symbols {
+		delete(ws.subsMap, token)
+		if _, exist := mdsServer.subsConnMap[token]; exist {
+			delete(mdsServer.subsConnMap[token], ws.ID)
+		}
+	}
+}
+
+func (mdsServer *MDSServer) SendTick(token string, packet Quote1packet) {
+	mdsServer.quote1Map[token] = convertQuote1ToBytes(packet)
+	mdsServer.tokenChan <- token
+}
+
+func convertQuote1ToBytes(packet Quote1packet) []byte {
+	var buf *bytes.Buffer = bytes.NewBuffer(make([]byte, 22))
+	packetSize := int16(22)
+	quote1AppCode := uint8(100)
+	binary.Write(buf, binary.LittleEndian, packetSize)
+	binary.Write(buf, binary.LittleEndian, uint8(0))
+	binary.Write(buf, binary.LittleEndian, quote1AppCode)
+
+	symbol, _ := strconv.Atoi(packet.Symbol)
+	binary.Write(buf, binary.LittleEndian, int32(symbol))
+	binary.Write(buf, binary.LittleEndian, uint8(packet.ExchangeSegment))
+	binary.Write(buf, binary.LittleEndian, packet.LastTradedPrice)
+	binary.Write(buf, binary.LittleEndian, packet.LChange)
+	binary.Write(buf, binary.LittleEndian, packet.OI)
+	binary.Write(buf, binary.LittleEndian, packet.OIChange)
+	return buf.Bytes()
+
+}
+
+func (mdsServer *MDSServer) communicateTick() {
+	for val := range mdsServer.tokenChan {
+		if chans, exist := mdsServer.subsConnMap[val]; exist {
+			for _, client := range chans {
+				if len(client.dataChan) < 10000 {
+					client.dataChan <- val
+				}
+			}
+		}
+	}
+}
+
+func (mdsServer *MDSServer) onClose(client *client) {
+	symbols := make([]string, 0)
+	for k := range client.subsMap {
+		symbols = append(symbols, k)
+	}
+	mdsServer.unsubscribe(symbols, client)
+}
+
+func (mdsServer *MDSServer) writeTickToClient(client *client) {
+	//defer close(tickChan)
+	for val := range client.dataChan {
+		data := mdsServer.quote1Map[val]
+		err := wsutil.WriteClientBinary(client.conn, data)
+		if err != nil {
+			log.Printf("failed to write message %v", err)
+			if strings.Contains(err.Error(), "use of closed network connection") {
+				log.Printf("returning from closed connection")
+				mdsServer.onClose(client)
+				return
+			}
+
+		}
+	}
+}
