@@ -9,13 +9,15 @@ import (
 	"github.com/gorilla/websocket"
 	"log"
 	"net/http"
+	"time"
+
 	//_ "net/http/pprof"
 	"strconv"
 	"strings"
 	"sync"
 )
 
-var maxPacketsPerClient int = 1000
+var maxPacketsPerClient = 10
 
 var upgrader = websocket.Upgrader{} // use default options
 
@@ -115,7 +117,6 @@ func (mdsServer *MDSServer) connect(w http.ResponseWriter, r *http.Request) {
 }
 
 func (mdsServer *MDSServer) readData(client *client) {
-	defer mdsServer.onClose(client)
 	go mdsServer.writeTickToClient(client)
 	for {
 		mType, msg, err := client.conn.ReadMessage()
@@ -214,8 +215,10 @@ func (mdsServer *MDSServer) readTickPayload() {
 func (mdsServer *MDSServer) communicateTick(val *tickPayload) {
 	if chans, exist := mdsServer.subsConnMap[val.token]; exist {
 		for _, client := range chans {
-			if len(client.dataChan) < 10000 {
+			if len(client.dataChan) < maxPacketsPerClient-1 {
 				client.dataChan <- val.payload
+			} else {
+				fmt.Printf("\nignoring packet for client %s as channel is full", client.ID)
 			}
 		}
 	}
@@ -236,6 +239,8 @@ func (mdsServer *MDSServer) writeTickToClient(client *client) {
 	//defer close(tickChan)
 	for val := range client.dataChan {
 		//data, _ := mdsServer.quote1Map.Load(val)
+		client.conn.SetWriteDeadline(time.Now().Add(1 * time.Second))
+
 		err := client.conn.WriteMessage(websocket.BinaryMessage, val)
 		if err != nil {
 			log.Printf("failed to write message %v", err)

@@ -14,7 +14,7 @@ func main() {
 }
 
 func startLoad(ws *websocket.MDSServer) {
-	ticker := time.NewTicker(500 * time.Millisecond)
+	ticker := time.NewTicker(1 * time.Millisecond)
 	done := make(chan bool)
 	quote1Packet := websocket.Quote1packet{}
 	quote1Packet.Symbol = "test"
@@ -29,7 +29,7 @@ func startLoad(ws *websocket.MDSServer) {
 		case <-done:
 			return
 		case _ = <-ticker.C:
-			for i := 1; i < 3; i++ {
+			for i := 1; i < 2; i++ {
 				ws.SendTick(fmt.Sprintf("%s-%d", quote1Packet.Symbol, i), quote1Packet)
 			}
 		}
