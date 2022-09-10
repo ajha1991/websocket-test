@@ -92,6 +92,7 @@ func (mdsServer *MDSServer) createSubsConnMap() {
 func (mdsServer *MDSServer) connect(w http.ResponseWriter, r *http.Request) {
 	connected++
 	log.Printf("connection started %d", connected)
+	device := r.Header.Get("device")
 	upgrader.CheckOrigin = func(r *http.Request) bool { return true }
 	conn, err := upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -104,7 +105,7 @@ func (mdsServer *MDSServer) connect(w http.ResponseWriter, r *http.Request) {
 	uid, _ := uuid.NewUUID()
 
 	client := client{
-		ID:       uid.String(),
+		ID:       device + " : " + uid.String(),
 		dataChan: make(chan []byte, maxPacketsPerClient),
 		conn:     conn,
 		subsMap:  make(map[string]bool),
@@ -112,7 +113,7 @@ func (mdsServer *MDSServer) connect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	go mdsServer.readData(&client)
-	log.Printf("connection complete  %s - %d ", uid.String(), connected)
+	log.Printf("connection complete  %s - %d ", client.ID, connected)
 
 }
 
